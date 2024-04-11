@@ -7,14 +7,16 @@ import (
 )
 
 type ServerConfig struct {
-	Address           string
-	Port              uint16
-	DisableKeepAlives bool
+	Address              string
+	Port                 uint16
+	DisableKeepAlives    bool
+	BucketEndpointDomain string
 }
 
 type BucketConfig struct {
 	AccessKeyId     string
 	SecretAccessKey string
+	Endpoint        string
 	EncryptionKey   string
 	RetryCount      int
 	RetryDelay      int

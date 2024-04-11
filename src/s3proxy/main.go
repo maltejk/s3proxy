@@ -9,7 +9,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"sort"
@@ -56,42 +55,45 @@ func (h *ProxyHandler) GetBucketSecurityCredentials(c *BucketConfig) (*Credentia
 	return h.credentialCache.GetRoleCredentials()
 }
 
-var AwsDomain = "s3.amazonaws.com"
-
 func (h *ProxyHandler) GetBucketInfo(r *http.Request) *BucketInfo {
-	var portIdx = strings.IndexRune(r.Host, ':')
+	var hostWithoutPort string
 
-	if portIdx == -1 {
-		portIdx = len(r.Host)
-	}
+	// Extract host without port
+	hostPortParts := strings.Split(r.Host, ":")
+	hostWithoutPort = hostPortParts[0]
 
-	host := r.Host[0:portIdx]
+	// remove BucketEndpointDomain from host
+	trimmedHostParts := strings.TrimSuffix(hostWithoutPort, h.config.Server.BucketEndpointDomain)
+	InfoLogger.Printf("Stripped host name to: %s", trimmedHostParts)
 
-	if !strings.HasSuffix(host, AwsDomain) {
+	// Extract region from host if present
+	hostParts := strings.Split(trimmedHostParts, ".")
+	InfoLogger.Printf("Got host parts: %s", hostParts)
+
+	// Check if host ends with BucketEndpointDomain
+	if !strings.HasSuffix(hostWithoutPort, h.config.Server.BucketEndpointDomain) {
 		return nil
 	}
 
+	// Extract bucket name from URL path
 	var bucketName string
-	// Whether the URL was using bucket.s3.amazonaws.com instead of s3.amazonaws.com/bucket/
-	var bucketVirtualHost = false
+	var bucketVirtualHost bool
 
-	if len(host) > len(AwsDomain) {
-		bucketName = host[0 : len(host)-len(AwsDomain)-1]
+	if len(hostParts) > 3 && hostParts[1] != "s3" {
+		bucketName = hostParts[1]
 		bucketVirtualHost = true
 	} else {
 		tokens := strings.Split(r.URL.Path, "/")
-
 		// Split produces empty tokens which we are not interested in
 		for _, t := range tokens {
 			if t == "" {
 				continue
 			}
-
 			bucketName = t
 			break
 		}
 	}
-
+	InfoLogger.Printf("Found bucket name: %s", bucketName)
 	return &BucketInfo{
 		Name:        bucketName,
 		VirtualHost: bucketVirtualHost,
@@ -105,7 +107,7 @@ func (h *ProxyHandler) PreRequestEncryptionHook(r *http.Request, innerRequest *h
 	}
 
 	// If this is a "copy" PUT, we should send no body at all
-	for k, _ := range r.Header {
+	for k := range r.Header {
 		if strings.HasPrefix(strings.ToLower(k), "x-amz-copy-source") {
 			return nil, nil
 		}
@@ -123,7 +125,7 @@ func (h *ProxyHandler) PreRequestEncryptionHook(r *http.Request, innerRequest *h
 	// they match.
 	innerBodyHash := NewCountingHash(md5.New())
 	teereader := io.TeeReader(encryptedInput, innerBodyHash)
-	innerRequest.Body = ioutil.NopCloser(teereader)
+	innerRequest.Body = io.NopCloser(teereader)
 
 	if length := innerRequest.ContentLength; length != -1 {
 		innerRequest.ContentLength += extralen
@@ -237,7 +239,7 @@ func (h *ProxyHandler) SignRequest(r *http.Request, info *BucketInfo) error {
 
 	amzHeaders := []string{}
 
-	for k, _ := range r.Header {
+	for k := range r.Header {
 		if !strings.HasPrefix(strings.ToLower(k), "x-amz-") {
 			continue
 		}
@@ -293,7 +295,7 @@ func failRequest(w http.ResponseWriter, format string, args ...interface{}) {
 	const ErrorFooter = "\n\nGreetings, the S3Proxy\n"
 
 	w.WriteHeader(http.StatusInternalServerError)
-	fmt.Fprintf(w, format + ErrorFooter, args...)
+	fmt.Fprintf(w, format+ErrorFooter, args...)
 	ErrorLogger.Printf(format, args...)
 }
 
@@ -303,10 +305,12 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	info := h.GetBucketInfo(r)
 
 	if info == nil {
-		InfoLogger.Print("Not an S3 request")
+		failRequest(w, "Not an S3 request %s %s %s", r.Method, r.URL, r.Host)
+		return
 	} else {
 		if info.Config == nil {
-			InfoLogger.Printf("No configuration for S3 bucket %s", info.Name)
+			failRequest(w, "No configuration for S3 bucket %s", info.Name)
+			return
 		} else {
 			InfoLogger.Printf("Handling request for bucket %s", info.Name)
 		}
@@ -330,8 +334,24 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Trailer:          r.Trailer,
 	}
 
-	innerRequest.URL.Scheme = "http"
-	innerRequest.URL.Host = r.Host
+	// it always is
+	innerRequest.URL.Scheme = "https"
+
+	if info.Config.Endpoint != "" {
+		// use configured endpoint and don't bother
+		innerRequest.URL.Host = info.Config.Endpoint
+		InfoLogger.Printf("Using endpoint from bucket config: %s", info.Config.Endpoint)
+	} else {
+		// get rid of the port in r.Host
+		var portIdx = strings.IndexRune(r.Host, ':')
+
+		if portIdx == -1 {
+			portIdx = len(r.Host)
+		}
+
+		host := r.Host[0:portIdx]
+		innerRequest.URL.Host = host
+	}
 
 	var originalBodyHash *CountingHash
 
@@ -341,7 +361,7 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		originalBodyHash = NewCountingHash(md5.New())
 
 		teereader := io.TeeReader(r.Body, originalBodyHash)
-		r.Body = ioutil.NopCloser(teereader)
+		r.Body = io.NopCloser(teereader)
 	}
 
 	err := h.SignRequest(innerRequest, info)
@@ -362,14 +382,13 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	retryCount := 0
 	retryDelay := 0
 
-	if info != nil && info.Config != nil {
-		maxRetryCount = info.Config.RetryCount
-		retryDelay = info.Config.RetryDelay
-	}
+	maxRetryCount = info.Config.RetryCount
+	retryDelay = info.Config.RetryDelay
 
 	var innerResponse *http.Response
 
 	for {
+		InfoLogger.Printf("Requesting with %v", innerRequest)
 		innerResponse, err = h.client.Do(innerRequest)
 
 		if err == nil && innerResponse.StatusCode < 300 {
@@ -498,5 +517,7 @@ func main() {
 	handler := NewProxyHandler(config)
 
 	listenAddress := fmt.Sprintf("%s:%d", config.Server.Address, config.Server.Port)
+
+	InfoLogger.Printf("Listening on %s", listenAddress)
 	http.ListenAndServe(listenAddress, handler)
 }
